@@ -16,13 +16,16 @@ UWAGA: pliki sa NIEZALEZNYMI filtrami (kopiami wybranych rekordow). Nic nie jest
 z danych zrodlowych, a ten sam rekord moze trafic do kilku plikow naraz (np. Plik 2, 3 i 6).
 
 PLIKI WYNIKOWE:
+    Pliki 1/2/3 maja dwie pierwsze kolumny: Kod AA i Nr Strato, a dalej wszystkie pozostale dane
+    pacjenta AA oraz (jesli istnieje) powiazanego pacjenta Strato.
+
     Plik 1 [4T]  : pacjent AA BEZ Nr Strato, znaleziono pewne dopasowanie 1:1 -> dodac Nr Strato
-                   (kolumny: Kod AA, Nr Strato)
     Plik 2 [4T]  : pacjent AA polaczony BLEDNIE (nazwa nie 100% lub numeru brak w Strato) -> usunac Nr Strato
-                   (WSZYSTKIE bledne polaczenia; kolumny: Kod AA, Nr Strato [stary])
+                   (WSZYSTKIE bledne polaczenia; Nr Strato = stary)
     Plik 3 [4T]  : pacjent AA polaczony BLEDNIE, znaleziono wlasciwy zamiennik 100% -> dodac nowy
-                   (podzbior Pliku 2; kolumny: Kod AA, Nr Strato [nowy])
-    Plik 4 [AUD] : wszystkie rekordy AA bedace dzialalnosciami gospodarczymi (pelne kolumny AA)
+                   (podzbior Pliku 2; Nr Strato = nowy)
+    Plik 4 [AUD] : wszystkie rekordy AA bedace dzialalnosciami gospodarczymi (pelne kolumny AA);
+                   rekordy z Pliku 4 sa wylaczone z Plikow 1, 2, 3, 5, 6
     Plik 5 [AUD] : kandydaci niepewni - AA bez Nr Strato pasujacy po kryteriach, ale niepewnie
                    (jeden wiersz = dane AA + dane Strato)
     Plik 6 [AUD] : nazwy do sprawdzenia - istniejace polaczenia z fuzzy nazwa 90-99%
@@ -44,10 +47,12 @@ FILTER_TRASH = 1
 
 # 1 = odfiltruj pacjentow nieaktywnych do pliku "Nieaktywni" przed dopasowaniem
 # 0 = nieaktywni biora udzial w dopasowaniu jak reszta
-FILTER_INACTIVE = 0
+FILTER_INACTIVE = 1
 
-# Slowa-klucze w kolumnie statusu oznaczajace pacjenta NIEAKTYWNEGO (male litery, dopasowanie czesciowe)
-INACTIVE_KEYWORDS = ['nieaktyw', 'archiw', 'zarchiw', 'usuni', 'zamkni', 'zablokow', 'nieczynn']
+# Wartosci kolumny statusu oznaczajace pacjenta AKTYWNEGO (osobno dla kazdej bazy).
+# Kazda inna wartosc (w tym pusta) jest traktowana jako NIEAKTYWNY. Porownanie ignoruje wielkosc liter.
+AA_ACTIVE_STATUS_VALUES = ['Aktywny']    # AA (Enova): aktywny = "Aktywny"
+ST_ACTIVE_STATUS_VALUES = ['1']          # Strato: aktywny = "1"
 
 # Progi dopasowania nazwy
 NAME_EXACT = 100        # dokladne dopasowanie imienia i nazwiska (Pliki 1, 2, 3)
@@ -72,9 +77,9 @@ AA_KOD       = 'Numer pacjenta w Enovie (Kod)'  # identyfikator pacjenta AA -> k
 AA_STRATO    = 'Numer Strato'                   # przypisany Nr Strato (moze byc pusty)
 AA_PESEL     = 'PESEL'
 AA_DATA_UR   = 'Data urodzenia'
-AA_IMIE      = 'Imię'
+AA_IMIE      = 'Imie'                           # UWAGA: w eksporcie AA bez ogonka (Imie, nie Imię)
 AA_NAZWISKO  = 'Nazwisko'
-AA_NAZWA     = 'Kontrahenci.Nazwa'              # imie i nazwisko razem (jesli brak osobnych kolumn - rozdzielamy)
+AA_NAZWA     = 'Kontrahenci.Nazwa'              # rezerwowo: gdy brak osobnych kolumn Imie/Nazwisko (w tym eksporcie nieobecna)
 AA_KOD_POCZT = 'Kod pocztowy'
 AA_MIEJSC    = 'Miejscowość'
 AA_ULICA     = 'Ulica'
@@ -265,17 +270,18 @@ def split_trash(df, source):
     return clean_df, trash_df
 
 
-def split_inactive(df, status_col, source):
-    """Oddziela pacjentow nieaktywnych (wg slow-kluczy w kolumnie statusu)."""
+def split_inactive(df, status_col, source, active_values):
+    """Oddziela pacjentow nieaktywnych. Aktywny = status ma jedna z wartosci active_values
+    (porownanie ignoruje wielkosc liter); kazda inna wartosc (w tym pusta) = nieaktywny."""
     if status_col not in df.columns:
         return df, df.head(0).copy()
-    st = df[status_col].fillna('').astype(str).str.strip().str.lower()
-    pattern = '|'.join(INACTIVE_KEYWORDS)
-    mask = st.str.contains(pattern, na=False)
-    inactive_df = df[mask].copy()
+    st = df[status_col].fillna('').astype(str).str.replace(r'\.0$', '', regex=True).str.strip().str.lower()
+    active_vals = [str(v).strip().lower() for v in active_values]
+    active_mask = st.isin(active_vals)
+    inactive_df = df[~active_mask].copy()
     if not inactive_df.empty:
         inactive_df['_Source'] = source
-    return df[~mask].copy(), inactive_df
+    return df[active_mask].copy(), inactive_df
 
 
 # ==========================================
@@ -290,12 +296,18 @@ def is_business_mask(df):
     if '_nip' in df.columns:
         mask = mask | df['_nip'].notna()
 
-    # 2. Grupa inna niz pacjenci
+    # 2. Podatnik VAT = 1 lub Forma prawna = 1 -> dzialalnosc gospodarcza
+    for col in [AA_VAT, AA_FORMA]:
+        if col in df.columns:
+            v = df[col].fillna('').astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+            mask = mask | (v == '1')
+
+    # 3. Grupa inna niz pacjenci
     if AA_GRUPA in df.columns:
         grupa = df[AA_GRUPA].astype(str).str.strip().str.upper()
         mask = mask | (grupa != GRUPA_PATIENT.upper())
 
-    # 3. Heurystyka: nazwa zawiera slowa-klucze firmowe
+    # 4. Heurystyka: nazwa zawiera slowa-klucze firmowe
     kw = '|'.join(k.replace('.', r'\.') for k in BUSINESS_KEYWORDS)
     name_l = df['_full'].fillna('').astype(str)
     mask = mask | name_l.str.contains(kw, na=False, regex=True)
@@ -345,6 +357,21 @@ def pairs_to_full_rows(pair_df, aa, st):
     return drop_internal(m).reset_index(drop=True)
 
 
+def enrich_action(items, aa, st):
+    """Buduje wiersze dla Plikow 1/2/3: pierwsze dwie kolumny to Kod AA i Nr Strato,
+    a dalej wszystkie dane pacjenta AA oraz (jesli jest) powiazanego pacjenta Strato.
+    items: lista dict z kluczami _aid, _sid (moze byc None), 'Kod AA', 'Nr Strato'."""
+    cols_first = ['Kod AA', 'Nr Strato']
+    if not items:
+        return pd.DataFrame(columns=cols_first)
+    base = pd.DataFrame(items)
+    m = base.merge(aa, left_on='_aid', right_on='_id', how='left')
+    m = m.merge(st, left_on='_sid', right_on='_id', how='left', suffixes=('_AA', '_Strato'))
+    m = drop_internal(m)
+    ordered = cols_first + [c for c in m.columns if c not in cols_first]
+    return m[ordered].reset_index(drop=True)
+
+
 # ==========================================
 # KLASYFIKACJA -> 6 plikow
 # ==========================================
@@ -368,7 +395,7 @@ def classify(aa_patients, st_patients):
     fuzzy_band = pairs[(pairs['score'] >= NAME_FUZZY_MIN) & (pairs['score'] < NAME_EXACT)] if not pairs.empty else pairs
 
     # ---------- PLIK 1 + PLIK 5 (pacjenci AA bez Nr Strato) ----------
-    file1_rows, file1_aa_ids = [], set()
+    file1_items, file1_aa_ids = [], set()
     if not confident.empty:
         conf_ns = confident[confident['_id_aa'].isin(no_strato_ids)]
         st_conf_count = conf_ns.groupby('_id_st')['_id_aa'].nunique().to_dict()
@@ -376,10 +403,10 @@ def classify(aa_patients, st_patients):
             st_ids = grp['_id_st'].unique()
             if len(st_ids) == 1 and st_conf_count.get(st_ids[0], 0) == 1:
                 row = grp.iloc[0]
-                file1_rows.append({'Kod AA': aa_kod.get(aa_id, ''), 'Nr Strato': row['_nr']})
+                file1_items.append({'_aid': aa_id, '_sid': row['_id_st'],
+                                    'Kod AA': aa_kod.get(aa_id, ''), 'Nr Strato': row['_nr']})
                 file1_aa_ids.add(aa_id)
-    if file1_rows:
-        result['file1'] = pd.DataFrame(file1_rows).drop_duplicates().reset_index(drop=True)
+    result['file1'] = enrich_action(file1_items, aa_patients, st_patients)
 
     # Plik 5: bez Nr Strato, pasuja po kryteriach (score >= 90), ale nie sa pewnym 1:1 z Pliku 1
     if not pairs.empty:
@@ -410,23 +437,31 @@ def classify(aa_patients, st_patients):
     incorrect_ids = set(i for i in with_strato_ids if aa_strato.get(i, '') not in valid_nr)
     incorrect_ids |= set(aa_id for aa_id, sc in best.items() if sc < NAME_EXACT)
 
+    # Mapa Nr Strato -> wewnetrzne id rekordu Strato (do dolaczenia danych do Plikow 2/3)
+    nr_to_stid = {}
+    for sid, nr in zip(st_patients['_id'], st_patients['_nr']):
+        if nr and nr not in nr_to_stid:
+            nr_to_stid[nr] = sid
+
     # Szukanie zamiennika: pewne dopasowanie (100% + identyfikator) do INNEGO Nr Strato
-    file2_rows, file3_rows = [], []
+    file2_items, file3_items = [], []
     if not confident.empty:
         repl = confident[confident['_id_aa'].isin(incorrect_ids) &
                          (confident['_nr'] != confident['_strato'])]
         repl = repl.sort_values('_id_st').drop_duplicates('_id_aa')
         for _, row in repl.iterrows():
-            file3_rows.append({'Kod AA': aa_kod.get(row['_id_aa'], ''), 'Nr Strato': row['_nr']})
+            file3_items.append({'_aid': row['_id_aa'], '_sid': row['_id_st'],
+                                'Kod AA': aa_kod.get(row['_id_aa'], ''), 'Nr Strato': row['_nr']})
 
-    # Plik 2 = WSZYSTKIE bledne polaczenia (usun stary numer); Plik 3 to podzbior z zamiennikiem
+    # Plik 2 = WSZYSTKIE bledne polaczenia (usun stary numer); Plik 3 to podzbior z zamiennikiem.
+    # Do Pliku 2 dolaczamy dane blednie powiazanego pacjenta Strato, jesli stary numer istnieje w Strato.
     for aa_id in incorrect_ids:
-        file2_rows.append({'Kod AA': aa_kod.get(aa_id, ''), 'Nr Strato': aa_strato.get(aa_id, '')})
+        old_nr = aa_strato.get(aa_id, '')
+        file2_items.append({'_aid': aa_id, '_sid': nr_to_stid.get(old_nr),
+                            'Kod AA': aa_kod.get(aa_id, ''), 'Nr Strato': old_nr})
 
-    if file2_rows:
-        result['file2'] = pd.DataFrame(file2_rows).drop_duplicates().reset_index(drop=True)
-    if file3_rows:
-        result['file3'] = pd.DataFrame(file3_rows).drop_duplicates().reset_index(drop=True)
+    result['file2'] = enrich_action(file2_items, aa_patients, st_patients)
+    result['file3'] = enrich_action(file3_items, aa_patients, st_patients)
 
     return result
 
@@ -468,8 +503,8 @@ def main(path_aa, path_strato, output_folder):
 
     print(f"3b. Odfiltrowanie nieaktywnych, przelacznik = {FILTER_INACTIVE}...")
     if FILTER_INACTIVE:
-        df_aa, inact_aa = split_inactive(df_aa, AA_STATUS, 'AA')
-        df_st, inact_st = split_inactive(df_st, ST_STATUS, 'Strato')
+        df_aa, inact_aa = split_inactive(df_aa, AA_STATUS, 'AA', AA_ACTIVE_STATUS_VALUES)
+        df_st, inact_st = split_inactive(df_st, ST_STATUS, 'Strato', ST_ACTIVE_STATUS_VALUES)
         inactive_all = pd.concat([drop_internal(inact_aa), drop_internal(inact_st)], ignore_index=True)
     else:
         inactive_all = pd.DataFrame()
