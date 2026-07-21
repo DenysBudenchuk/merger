@@ -1,0 +1,8 @@
+# Zależności projektu
+# Instalacja: pip install -r requirements.txt
+# Wersje zamrożone: 2026-06-25
+
+pandas==3.0.3
+numpy==2.5.0
+openpyxl==3.1.5
+rapidfuzz==3.14.5
