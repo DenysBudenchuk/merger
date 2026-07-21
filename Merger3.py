@@ -37,6 +37,10 @@ import sys
 import pandas as pd
 from rapidfuzz import fuzz
 
+def log(msg):
+    """Wypisuje komunikat z flush=True, by pojawial sie natychmiast (a nie po zakonczeniu)."""
+    print(msg, flush=True)
+
 # ==========================================
 # KONFIGURACJA
 # ==========================================
@@ -57,6 +61,11 @@ ST_ACTIVE_STATUS_VALUES = ['1']          # Strato: aktywny = "1"
 # Progi dopasowania nazwy
 NAME_EXACT = 100        # dokladne dopasowanie imienia i nazwiska (Pliki 1, 2, 3)
 NAME_FUZZY_MIN = 90     # dolna granica fuzzy (Pliki 5, 6): 90 <= score < 100
+
+# Ochrona przed "wybuchem" par. Jesli ta sama wartosc identyfikatora (PESEL / telefon / email)
+# powtarza sie czesciej niz ponizej po ktorejkolwiek stronie, jest traktowana jako placeholder
+# (np. wspolny numer rejestracji) i pomijana w dopasowaniu. Ustaw 0, aby wylaczyc ochrone.
+MAX_KEY_OCCURRENCES = 100
 
 # Slowa-klucze oznaczajace smieci (TRASH)
 GARBAGE_KEYWORDS = ['test', 'brak', 'nieznany', 'n/a', 'brak danych', 'puste']
@@ -322,6 +331,7 @@ def build_candidate_pairs(aa, st):
     """Zwraca pary (AA, Strato) majace wspolny co najmniej jeden identyfikator
     (PESEL / Tel. kom. / Tel. dom. / Email) wraz z wynikiem dopasowania nazwy."""
     frames = []
+    labels = {'_pesel': 'PESEL', '_telkom': 'Tel.kom', '_teldom': 'Tel.dom', '_email': 'Email'}
     for key in ['_pesel', '_telkom', '_teldom', '_email']:
         a = aa[['_id', key]].copy()
         a = a[a[key].notna() & (a[key].astype(str).str.strip() != '')]
@@ -330,21 +340,38 @@ def build_candidate_pairs(aa, st):
         s = s[s[key].notna() & (s[key].astype(str).str.strip() != '')]
         s = s.rename(columns={key: '_k', '_id': '_id_st'})
         if a.empty or s.empty:
+            log(f"     - {labels[key]}: 0 par")
             continue
+
+        # Ochrona: pomijamy wartosci-placeholdery (zbyt czesto powtarzalne) po obu stronach
+        if MAX_KEY_OCCURRENCES:
+            bad = set(a['_k'].value_counts().loc[lambda c: c > MAX_KEY_OCCURRENCES].index) \
+                | set(s['_k'].value_counts().loc[lambda c: c > MAX_KEY_OCCURRENCES].index)
+            if bad:
+                a = a[~a['_k'].isin(bad)]
+                s = s[~s['_k'].isin(bad)]
+                log(f"     - {labels[key]}: pominieto {len(bad)} placeholderow (zbyt czestych wartosci)")
+            if a.empty or s.empty:
+                log(f"     - {labels[key]}: 0 par")
+                continue
+
         m = a.merge(s, on='_k')[['_id_aa', '_id_st']]
+        log(f"     - {labels[key]}: {len(m)} par")
         frames.append(m)
 
     if not frames:
         return pd.DataFrame(columns=['_id_aa', '_id_st', '_kod', '_strato', '_nr', 'score'])
 
     pairs = pd.concat(frames, ignore_index=True).drop_duplicates()
+    log(f"     - unikalnych par do porownania nazw: {len(pairs)}")
     pairs = pairs.merge(
         aa[['_id', '_kod', '_strato', '_full']].rename(columns={'_id': '_id_aa', '_full': '_full_aa'}),
         on='_id_aa')
     pairs = pairs.merge(
         st[['_id', '_nr', '_full']].rename(columns={'_id': '_id_st', '_full': '_full_st'}),
         on='_id_st')
-    pairs['score'] = pairs.apply(lambda r: fuzzy_score(r['_full_aa'], r['_full_st']), axis=1)
+    # Szybciej niz apply(axis=1): iterujemy po dwoch kolumnach naraz
+    pairs['score'] = [fuzzy_score(a, b) for a, b in zip(pairs['_full_aa'], pairs['_full_st'])]
     return pairs
 
 
@@ -376,6 +403,7 @@ def enrich_action(items, aa, st):
 # KLASYFIKACJA -> 6 plikow
 # ==========================================
 def classify(aa_patients, st_patients):
+    log("   5a. Budowanie par-kandydatow (wspolny identyfikator) i porownanie nazw...")
     pairs = build_candidate_pairs(aa_patients, st_patients)
 
     empty2 = pd.DataFrame(columns=['Kod AA', 'Nr Strato'])
@@ -390,11 +418,13 @@ def classify(aa_patients, st_patients):
 
     no_strato_ids   = set(aa_patients[aa_patients['_strato'] == '']['_id'])
     with_strato_ids = set(aa_patients[aa_patients['_strato'] != '']['_id'])
+    log(f"   5b. Pacjenci AA bez Nr Strato: {len(no_strato_ids)} | z Nr Strato: {len(with_strato_ids)}")
 
     confident = pairs[pairs['score'] == NAME_EXACT] if not pairs.empty else pairs
     fuzzy_band = pairs[(pairs['score'] >= NAME_FUZZY_MIN) & (pairs['score'] < NAME_EXACT)] if not pairs.empty else pairs
 
     # ---------- PLIK 1 + PLIK 5 (pacjenci AA bez Nr Strato) ----------
+    log("   5c. Tworzenie Plikow 1 i 5 (pacjenci bez Nr Strato)...")
     file1_items, file1_aa_ids = [], set()
     if not confident.empty:
         conf_ns = confident[confident['_id_aa'].isin(no_strato_ids)]
@@ -416,12 +446,13 @@ def classify(aa_patients, st_patients):
         result['file5'] = pairs_to_full_rows(f5, aa_patients, st_patients)
 
     # ---------- PLIK 6 + wykrycie blednych polaczen (pacjenci AA z Nr Strato) ----------
+    log("   5d. Sprawdzanie istniejacych polaczen (Plik 6) i wykrywanie blednych (Pliki 2/3)...")
     aa_ws = aa_patients[aa_patients['_id'].isin(with_strato_ids)][['_id', '_strato', '_full']] \
         .rename(columns={'_id': 'aa_id', '_full': 'aa_full'})
     st_small = st_patients[['_id', '_nr', '_full']].rename(columns={'_id': 'st_id', '_full': 'st_full'})
     linked = aa_ws.merge(st_small, left_on='_strato', right_on='_nr')  # tylko istniejace numery
     if not linked.empty:
-        linked['score'] = linked.apply(lambda r: fuzzy_score(r['aa_full'], r['st_full']), axis=1)
+        linked['score'] = [fuzzy_score(a, b) for a, b in zip(linked['aa_full'], linked['st_full'])]
         best = linked.groupby('aa_id')['score'].max().to_dict()
     else:
         best = {}
@@ -463,6 +494,8 @@ def classify(aa_patients, st_patients):
     result['file2'] = enrich_action(file2_items, aa_patients, st_patients)
     result['file3'] = enrich_action(file3_items, aa_patients, st_patients)
 
+    log(f"   5e. Gotowe. Plik1={len(result['file1'])}, Plik2={len(result['file2'])}, "
+        f"Plik3={len(result['file3'])}, Plik5={len(result['file5'])}, Plik6={len(result['file6'])}")
     return result
 
 
@@ -477,47 +510,51 @@ def save_to_csv_folder(dataframes_dict, folder_name):
         if df is None:
             df = pd.DataFrame()
         df.to_csv(path, index=False, sep=';', encoding='utf-8-sig')
-        print(f"[OK] Zapisano: {path} ({len(df)} wierszy)")
+        log(f"[OK] Zapisano: {path} ({len(df)} wierszy)")
 
 
 # ==========================================
 # GLOWNY PROCES
 # ==========================================
 def main(path_aa, path_strato, output_folder):
-    print("1. Wczytywanie danych...")
+    log("1. Wczytywanie danych...")
     df_aa_raw = pd.read_csv(path_aa, sep=';', encoding='utf-8', dtype=str)
     df_st_raw = pd.read_csv(path_strato, sep=';', encoding='utf-8', dtype=str)
     init_aa, init_st = len(df_aa_raw), len(df_st_raw)
+    log(f"   Wczytano: AA = {init_aa} wierszy, Strato = {init_st} wierszy")
 
-    print("2. Przygotowanie i normalizacja...")
+    log("2. Przygotowanie i normalizacja...")
     df_aa = prepare_aa(df_aa_raw)
     df_st = prepare_st(df_st_raw)
 
-    print(f"3. Odfiltrowanie smieci (TRASH), przelacznik = {FILTER_TRASH}...")
+    log(f"3. Odfiltrowanie smieci (TRASH), przelacznik = {FILTER_TRASH}...")
     if FILTER_TRASH:
         df_aa, trash_aa = split_trash(df_aa, 'AA')
         df_st, trash_st = split_trash(df_st, 'Strato')
         trash_all = pd.concat([drop_internal(trash_aa), drop_internal(trash_st)], ignore_index=True)
+        log(f"   Smieci: {len(trash_all)} | zostalo: AA = {len(df_aa)}, Strato = {len(df_st)}")
     else:
         trash_all = pd.DataFrame()
 
-    print(f"3b. Odfiltrowanie nieaktywnych, przelacznik = {FILTER_INACTIVE}...")
+    log(f"3b. Odfiltrowanie nieaktywnych, przelacznik = {FILTER_INACTIVE}...")
     if FILTER_INACTIVE:
         df_aa, inact_aa = split_inactive(df_aa, AA_STATUS, 'AA', AA_ACTIVE_STATUS_VALUES)
         df_st, inact_st = split_inactive(df_st, ST_STATUS, 'Strato', ST_ACTIVE_STATUS_VALUES)
         inactive_all = pd.concat([drop_internal(inact_aa), drop_internal(inact_st)], ignore_index=True)
+        log(f"   Nieaktywni: {len(inactive_all)} | zostalo: AA = {len(df_aa)}, Strato = {len(df_st)}")
     else:
         inactive_all = pd.DataFrame()
 
-    print("4. Plik 4: izolacja dzialalnosci gospodarczych...")
+    log("4. Plik 4: izolacja dzialalnosci gospodarczych...")
     b_mask = is_business_mask(df_aa)
     business_df = drop_internal(df_aa[b_mask].copy())
     aa_patients = df_aa[~b_mask].copy()
+    log(f"   Biznesy: {len(business_df)} | pacjenci AA do dopasowania: {len(aa_patients)}")
 
-    print("5. Klasyfikacja pacjentow (Missing Connection)...")
+    log(f"5. Klasyfikacja pacjentow (Missing Connection), pacjentow AA = {len(aa_patients)}, Strato = {len(df_st)}...")
     res = classify(aa_patients, df_st)
 
-    print("6. Podsumowanie...")
+    log("6. Podsumowanie...")
     stats = [
         {'Plik': 'Wejscie AA',   'Liczba wierszy': init_aa},
         {'Plik': 'Wejscie Strato', 'Liczba wierszy': init_st},
@@ -532,7 +569,7 @@ def main(path_aa, path_strato, output_folder):
     ]
     df_summary = pd.DataFrame(stats)
 
-    print(f"7. Zapis wynikow do folderu: {output_folder}...")
+    log(f"7. Zapis wynikow do folderu: {output_folder}...")
     export = {
         'Podsumowanie': df_summary,
         '4T_Plik1_Dodaj_NrStrato': res['file1'],
@@ -545,7 +582,7 @@ def main(path_aa, path_strato, output_folder):
         'Nieaktywni': inactive_all,
     }
     save_to_csv_folder(export, output_folder)
-    print("Zakonczono pomyslnie.")
+    log("Zakonczono pomyslnie.")
 
 
 if __name__ == '__main__':
