@@ -120,7 +120,14 @@ ST_EMAIL     = 'Email'
 ST_TEL_DOM   = 'Telefon domowy'
 ST_TEL_KOM   = 'Telefon komórkowy'
 ST_TEL_PRACA = 'Telefon do pracy'
-ST_STATUS    = 'Status pacjenta'
+ST_STATUS    = 'Status pacjenta'                # UWAGA: w Strato z malej litery (inaczej niz w AA)
+
+# Listy oczekiwanych kolumn (do dopasowania naglowkow niezaleznie od wielkosci liter/spacji)
+AA_ALL_COLS = [AA_KOD, AA_STRATO, AA_PESEL, AA_DATA_UR, AA_IMIE, AA_NAZWISKO, AA_KOD_POCZT,
+               AA_MIEJSC, AA_ULICA, AA_NR_DOMU, AA_NR_LOKALU, AA_EMAIL, AA_TEL_STAC, AA_TEL_KOM,
+               AA_NIP, AA_FORMA, AA_VAT, AA_GRUPA, AA_STATUS]
+ST_ALL_COLS = [ST_NR, ST_PESEL, ST_IMIE, ST_NAZWISKO, ST_DATA, ST_KOD_POCZT, ST_MIASTO,
+               ST_ADRES1, ST_ADRES2, ST_ADRES3, ST_EMAIL, ST_TEL_DOM, ST_TEL_KOM, ST_TEL_PRACA, ST_STATUS]
 
 
 # ==========================================
@@ -130,10 +137,12 @@ def _empty_series(n):
     return pd.Series([None] * n)
 
 def norm_id(series):
-    """Normalizuje identyfikator Strato (usuwa .0, WIELKIE litery, czysci puste)."""
+    """Normalizuje identyfikator Strato do porownania: usuwa .0, spacje, WIELKIE litery,
+    oraz WIODACE ZERA (Strato zapisuje np. '0175218', a AA '175218' - to ten sam numer)."""
     # UWAGA: pandas 3.0 nie zamienia juz NaN na 'nan' w astype(str) - stad fillna('') na wejsciu
     s = series.fillna('').astype(str).str.replace(r'\.0$', '', regex=True).str.strip().str.upper()
-    return s.replace({'NAN': '', 'NONE': '', 'NAT': ''})
+    s = s.replace({'NAN': '', 'NONE': '', 'NAT': ''})
+    return s.str.lstrip('0')  # 0175218 -> 175218 (rownowazne numery)
 
 def norm_phone(series):
     """Zostawia tylko cyfry i bierze ostatnie 9 (numer krajowy)."""
@@ -206,13 +215,29 @@ def drop_internal(df):
     """Usuwa kolumny pomocnicze (zaczynajace sie od '_')."""
     return df[[c for c in df.columns if not str(c).startswith('_')]]
 
+def align_headers(df, expected, source):
+    """Dopasowuje naglowki wejsciowe do oczekiwanych nazw niezaleznie od wielkosci liter
+    i zbednych spacji (np. 'Status pacjenta' vs 'Status Pacjenta'). Ostrzega o brakach."""
+    lut = {str(c).strip().lower(): c for c in df.columns}
+    rename = {}
+    for name in expected:
+        real = lut.get(name.strip().lower())
+        if real is not None and real != name:
+            rename[real] = name
+    if rename:
+        df = df.rename(columns=rename)
+    missing = [n for n in expected if n not in df.columns]
+    if missing:
+        log(f"   [UWAGA] {source}: nie znaleziono kolumn (sprawdz naglowki CSV): {missing}")
+    return df
+
 
 # ==========================================
 # PRZYGOTOWANIE DANYCH
 # ==========================================
 def prepare_aa(df):
     """Dodaje kolumny pomocnicze i (w razie potrzeby) rozdziela imie/nazwisko z Kontrahenci.Nazwa."""
-    df = df.copy()
+    df = align_headers(df.copy(), AA_ALL_COLS, 'AA')
     n = len(df)
 
     # Rozdzielenie imienia i nazwiska, jesli brak gotowych osobnych kolumn
@@ -239,7 +264,7 @@ def prepare_aa(df):
 
 def prepare_st(df):
     """Dodaje kolumny pomocnicze dla bazy Strato."""
-    df = df.copy()
+    df = align_headers(df.copy(), ST_ALL_COLS, 'Strato')
     n = len(df)
     imie = df[ST_IMIE].fillna('').astype(str) if ST_IMIE in df.columns else pd.Series([''] * n)
     nazw = df[ST_NAZWISKO].fillna('').astype(str) if ST_NAZWISKO in df.columns else pd.Series([''] * n)
