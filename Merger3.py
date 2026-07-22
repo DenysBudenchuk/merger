@@ -30,6 +30,9 @@ PLIKI WYNIKOWE:
                    (jeden wiersz = dane AA + dane Strato)
     Plik 6 [AUD] : nazwy do sprawdzenia - istniejace polaczenia z fuzzy nazwa 90-99%
                    (jeden wiersz = dane AA + dane Strato)
+
+    Poprawnie_Polaczone : poprawne polaczenia - ten sam Nr Strato, nazwa 100% + wspolny identyfikator,
+                          relacja 1:1 (nie n:1 / 1:n). Jeden wiersz = dane AA + dane Strato.
 """
 
 import os
@@ -143,6 +146,12 @@ def norm_id(series):
     s = series.fillna('').astype(str).str.replace(r'\.0$', '', regex=True).str.strip().str.upper()
     s = s.replace({'NAN': '', 'NONE': '', 'NAT': ''})
     return s.str.lstrip('0')  # 0175218 -> 175218 (rownowazne numery)
+
+def norm_id_display(series):
+    """Wersja numeru DO WYSWIETLENIA w wynikach: czysci .0 i spacje, ale ZACHOWUJE wiodace zera
+    (np. '0175218'). Uzywana w kolumnie 'Nr Strato' Plikow 1/2/3."""
+    s = series.fillna('').astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    return s.replace({'nan': '', 'NaN': '', 'None': '', 'none': '', 'NaT': ''})
 
 def norm_phone(series):
     """Zostawia tylko cyfry i bierze ostatnie 9 (numer krajowy)."""
@@ -258,7 +267,8 @@ def prepare_aa(df):
     df['_email']  = norm_email(df[AA_EMAIL])   if AA_EMAIL   in df.columns else pd.Series([''] * n)
     df['_nip']    = norm_nip(df[AA_NIP])        if AA_NIP     in df.columns else _empty_series(n)
     df['_kod']    = df[AA_KOD].fillna('').astype(str).str.strip() if AA_KOD in df.columns else pd.Series([''] * n)
-    df['_strato'] = norm_id(df[AA_STRATO])     if AA_STRATO  in df.columns else pd.Series([''] * n)
+    df['_strato'] = norm_id(df[AA_STRATO])         if AA_STRATO in df.columns else pd.Series([''] * n)
+    df['_strato_orig'] = norm_id_display(df[AA_STRATO]) if AA_STRATO in df.columns else pd.Series([''] * n)
     df['_id']     = ['AA_' + str(i) for i in range(n)]
     return df
 
@@ -274,8 +284,9 @@ def prepare_st(df):
     df['_telkom'] = norm_phone(df[ST_TEL_KOM]) if ST_TEL_KOM in df.columns else _empty_series(n)
     df['_teldom'] = norm_phone(df[ST_TEL_DOM]) if ST_TEL_DOM in df.columns else _empty_series(n)
     df['_email']  = norm_email(df[ST_EMAIL])   if ST_EMAIL   in df.columns else pd.Series([''] * n)
-    df['_nr']     = norm_id(df[ST_NR])         if ST_NR      in df.columns else pd.Series([''] * n)
-    df['_id']     = ['STR_' + str(i) for i in range(n)]
+    df['_nr']      = norm_id(df[ST_NR])         if ST_NR in df.columns else pd.Series([''] * n)
+    df['_nr_orig'] = norm_id_display(df[ST_NR]) if ST_NR in df.columns else pd.Series([''] * n)
+    df['_id']      = ['STR_' + str(i) for i in range(n)]
     return df
 
 
@@ -393,7 +404,7 @@ def build_candidate_pairs(aa, st):
         aa[['_id', '_kod', '_strato', '_full']].rename(columns={'_id': '_id_aa', '_full': '_full_aa'}),
         on='_id_aa')
     pairs = pairs.merge(
-        st[['_id', '_nr', '_full']].rename(columns={'_id': '_id_st', '_full': '_full_st'}),
+        st[['_id', '_nr', '_nr_orig', '_full']].rename(columns={'_id': '_id_st', '_full': '_full_st'}),
         on='_id_st')
     # Szybciej niz apply(axis=1): iterujemy po dwoch kolumnach naraz
     pairs['score'] = [fuzzy_score(a, b) for a, b in zip(pairs['_full_aa'], pairs['_full_st'])]
@@ -434,12 +445,13 @@ def classify(aa_patients, st_patients):
     empty2 = pd.DataFrame(columns=['Kod AA', 'Nr Strato'])
     result = {
         'file1': empty2.copy(), 'file2': empty2.copy(), 'file3': empty2.copy(),
-        'file5': pd.DataFrame(), 'file6': pd.DataFrame(),
+        'file5': pd.DataFrame(), 'file6': pd.DataFrame(), 'file7': pd.DataFrame(),
     }
 
-    aa_kod    = dict(zip(aa_patients['_id'], aa_patients['_kod']))
-    aa_strato = dict(zip(aa_patients['_id'], aa_patients['_strato']))
-    valid_nr  = set(st_patients['_nr']) - {''}
+    aa_kod        = dict(zip(aa_patients['_id'], aa_patients['_kod']))
+    aa_strato     = dict(zip(aa_patients['_id'], aa_patients['_strato']))
+    aa_strato_org = dict(zip(aa_patients['_id'], aa_patients['_strato_orig']))  # do wyswietlenia (z zerami)
+    valid_nr      = set(st_patients['_nr']) - {''}
 
     no_strato_ids   = set(aa_patients[aa_patients['_strato'] == '']['_id'])
     with_strato_ids = set(aa_patients[aa_patients['_strato'] != '']['_id'])
@@ -459,7 +471,7 @@ def classify(aa_patients, st_patients):
             if len(st_ids) == 1 and st_conf_count.get(st_ids[0], 0) == 1:
                 row = grp.iloc[0]
                 file1_items.append({'_aid': aa_id, '_sid': row['_id_st'],
-                                    'Kod AA': aa_kod.get(aa_id, ''), 'Nr Strato': row['_nr']})
+                                    'Kod AA': aa_kod.get(aa_id, ''), 'Nr Strato': row['_nr_orig']})
                 file1_aa_ids.add(aa_id)
     result['file1'] = enrich_action(file1_items, aa_patients, st_patients)
 
@@ -488,6 +500,18 @@ def classify(aa_patients, st_patients):
             .rename(columns={'aa_id': '_id_aa', 'st_id': '_id_st'})
         result['file6'] = pairs_to_full_rows(f6, aa_patients, st_patients)
 
+    # TABELA: poprawnie polaczone. Ten sam Nr Strato (istniejace polaczenie), nazwa 100%,
+    # wspolny identyfikator (para wystepuje w parach-kandydatach), oraz relacja 1:1 (nie n:1 / 1:n).
+    if not linked.empty:
+        aa_nr_cnt = aa_patients[aa_patients['_strato'] != '']['_strato'].value_counts().to_dict()
+        st_nr_cnt = st_patients[st_patients['_nr'] != '']['_nr'].value_counts().to_dict()
+        pair_set = set(zip(pairs['_id_aa'], pairs['_id_st'])) if not pairs.empty else set()
+        one_to_one = linked['_nr'].map(lambda x: aa_nr_cnt.get(x, 0) == 1 and st_nr_cnt.get(x, 0) == 1)
+        has_ident = [(a, s) in pair_set for a, s in zip(linked['aa_id'], linked['st_id'])]
+        golden_mask = (linked['score'] == NAME_EXACT) & one_to_one & pd.Series(has_ident, index=linked.index)
+        f7 = linked[golden_mask][['aa_id', 'st_id']].rename(columns={'aa_id': '_id_aa', 'st_id': '_id_st'})
+        result['file7'] = pairs_to_full_rows(f7, aa_patients, st_patients)
+
     # Bledne polaczenie: numer nie istnieje w Strato LUB istnieje, ale nazwa nie zgadza sie DOKLADNIE 100%
     # (pliki sa niezaleznymi filtrami - ten sam rekord moze trafic do Pliku 2, 3 oraz 6 jednoczesnie)
     incorrect_ids = set(i for i in with_strato_ids if aa_strato.get(i, '') not in valid_nr)
@@ -507,20 +531,22 @@ def classify(aa_patients, st_patients):
         repl = repl.sort_values('_id_st').drop_duplicates('_id_aa')
         for _, row in repl.iterrows():
             file3_items.append({'_aid': row['_id_aa'], '_sid': row['_id_st'],
-                                'Kod AA': aa_kod.get(row['_id_aa'], ''), 'Nr Strato': row['_nr']})
+                                'Kod AA': aa_kod.get(row['_id_aa'], ''), 'Nr Strato': row['_nr_orig']})
 
     # Plik 2 = WSZYSTKIE bledne polaczenia (usun stary numer); Plik 3 to podzbior z zamiennikiem.
     # Do Pliku 2 dolaczamy dane blednie powiazanego pacjenta Strato, jesli stary numer istnieje w Strato.
     for aa_id in incorrect_ids:
-        old_nr = aa_strato.get(aa_id, '')
-        file2_items.append({'_aid': aa_id, '_sid': nr_to_stid.get(old_nr),
-                            'Kod AA': aa_kod.get(aa_id, ''), 'Nr Strato': old_nr})
+        old_nr_key = aa_strato.get(aa_id, '')             # do wyszukania w Strato (bez wiodacych zer)
+        file2_items.append({'_aid': aa_id, '_sid': nr_to_stid.get(old_nr_key),
+                            'Kod AA': aa_kod.get(aa_id, ''),
+                            'Nr Strato': aa_strato_org.get(aa_id, '')})  # wyswietlamy oryginal (z zerami)
 
     result['file2'] = enrich_action(file2_items, aa_patients, st_patients)
     result['file3'] = enrich_action(file3_items, aa_patients, st_patients)
 
     log(f"   5e. Gotowe. Plik1={len(result['file1'])}, Plik2={len(result['file2'])}, "
-        f"Plik3={len(result['file3'])}, Plik5={len(result['file5'])}, Plik6={len(result['file6'])}")
+        f"Plik3={len(result['file3'])}, Plik5={len(result['file5'])}, Plik6={len(result['file6'])}, "
+        f"Poprawnie={len(result['file7'])}")
     return result
 
 
@@ -589,6 +615,7 @@ def main(path_aa, path_strato, output_folder):
         {'Plik': 'Plik4_Biznesy',             'Liczba wierszy': len(business_df)},
         {'Plik': 'Plik5_Kandydaci_Niepewni',  'Liczba wierszy': len(res['file5'])},
         {'Plik': 'Plik6_Nazwy_Do_Sprawdzenia', 'Liczba wierszy': len(res['file6'])},
+        {'Plik': 'Poprawnie_Polaczone',       'Liczba wierszy': len(res['file7'])},
         {'Plik': 'TRASH',                     'Liczba wierszy': len(trash_all)},
         {'Plik': 'Nieaktywni',                'Liczba wierszy': len(inactive_all)},
     ]
@@ -603,6 +630,7 @@ def main(path_aa, path_strato, output_folder):
         'AUD_Plik4_Biznesy': business_df,
         'AUD_Plik5_Kandydaci_Niepewni': res['file5'],
         'AUD_Plik6_Nazwy_Do_Sprawdzenia': res['file6'],
+        'Poprawnie_Polaczone': res['file7'],
         'TRASH': trash_all,
         'Nieaktywni': inactive_all,
     }
